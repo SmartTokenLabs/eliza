@@ -126,6 +126,28 @@ export class DirectClient {
         this.app.use(bodyParser.json());
         this.app.use(bodyParser.urlencoded({ extended: true }));
 
+        // Add IP address restriction middleware
+        this.app.use((req, res, next) => {
+            const requestIP = req.ip || req.socket.remoteAddress;
+            const allowedIPs = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+            
+            // Get the server's IP address
+            const serverIP = req.socket.localAddress;
+            if (serverIP) {
+                allowedIPs.push(serverIP);
+            }
+
+            if (!requestIP || !allowedIPs.includes(requestIP)) {
+                elizaLogger.warn(`Access denied from IP: ${requestIP}`);
+                res.status(403).json({ 
+                    success: false, 
+                    message: 'Access denied. Only requests from the same server are allowed.' 
+                });
+                return;
+            }
+            next();
+        });
+
         // Serve both uploads and generated images
         this.app.use(
             "/media/uploads",

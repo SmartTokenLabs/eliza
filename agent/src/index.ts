@@ -369,6 +369,45 @@ export async function loadCharacters(
     return loadedCharacters;
 }
 
+interface ReceivedCharacter {
+    name: string;
+    token_id: string;
+}
+
+export async function loadCharactersFromServer(): Promise<Character[]> {
+    const loadedCharacters: Character[] = [];
+    try {
+        const response = await fetch(`${process.env.CHARACTER_SERVER_URL}/fetch-characters`);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const characterData = await response.json();
+        const characters: ReceivedCharacter[] = characterData.characterNames as ReceivedCharacter[];
+
+        // iterate over the characters and load them
+        for (const char of characters) {
+            const tokenId = char.token_id;
+            const character = await loadCharacterFromServer(tokenId);
+            loadedCharacters.push(character);
+        }
+
+    } catch (error) {
+        elizaLogger.error(`Error loading characters from server: ${error}`);
+        elizaLogger.error(`Error details: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        elizaLogger.error(`Stack trace: ${error instanceof Error ? error.stack : 'No stack trace'}`);
+        throw error;
+    }
+
+    return loadedCharacters;
+}
+
+async function loadCharacterFromServer(token_id: string): Promise<Character> {
+    const response = await fetch(`${process.env.CHARACTER_SERVER_URL}/character/${token_id}`);
+    const characterData = await response.json();
+    const character: Character = characterData.character;
+    return character;
+}
+
 async function handlePluginImporting(plugins: string[]) {
     if (plugins.length > 0) {
         // this logging should happen before calling, so we can include important context
@@ -376,7 +415,7 @@ async function handlePluginImporting(plugins: string[]) {
         const importedPlugins = await Promise.all(
             plugins.map(async (plugin) => {
                 try {
-                    const importedPlugin:Plugin = await import(plugin);
+                    const importedPlugin: Plugin = await import(plugin);
                     const functionName =
                         plugin
                             .replace("@elizaos/plugin-", "")
@@ -384,11 +423,13 @@ async function handlePluginImporting(plugins: string[]) {
                             .replace(/-./g, (x) => x[1].toUpperCase()) +
                         "Plugin"; // Assumes plugin function is camelCased with Plugin suffix
                     if (!importedPlugin[functionName] && !importedPlugin.default) {
-                      elizaLogger.warn(plugin, 'does not have an default export or', functionName)
+                        elizaLogger.warn(plugin, 'does not have an default export or', functionName)
                     }
-                    return {...(
-                        importedPlugin.default || importedPlugin[functionName]
-                    ), npmName: plugin };
+                    return {
+                        ...(
+                            importedPlugin.default || importedPlugin[functionName]
+                        ), npmName: plugin
+                    };
                 } catch (importError) {
                     console.error(
                         `Failed to import plugin: ${plugin}`,
@@ -709,23 +750,23 @@ function initializeCache(
 }
 
 async function findDatabaseAdapter(runtime: AgentRuntime) {
-  const { adapters } = runtime;
-  let adapter: Adapter | undefined;
-  // if not found, default to sqlite
-  if (adapters.length === 0) {
-    const sqliteAdapterPlugin = await import('@elizaos-plugins/adapter-sqlite');
-    const sqliteAdapterPluginDefault = sqliteAdapterPlugin.default;
-    adapter = sqliteAdapterPluginDefault.adapters[0];
-    if (!adapter) {
-      throw new Error("Internal error: No database adapter found for default adapter-sqlite");
+    const { adapters } = runtime;
+    let adapter: Adapter | undefined;
+    // if not found, default to sqlite
+    if (adapters.length === 0) {
+        const sqliteAdapterPlugin = await import('@elizaos-plugins/adapter-sqlite');
+        const sqliteAdapterPluginDefault = sqliteAdapterPlugin.default;
+        adapter = sqliteAdapterPluginDefault.adapters[0];
+        if (!adapter) {
+            throw new Error("Internal error: No database adapter found for default adapter-sqlite");
+        }
+    } else if (adapters.length === 1) {
+        adapter = adapters[0];
+    } else {
+        throw new Error("Multiple database adapters found. You must have no more than one. Adjust your plugins configuration.");
     }
-  } else if (adapters.length === 1) {
-    adapter = adapters[0];
-  } else {
-    throw new Error("Multiple database adapters found. You must have no more than one. Adjust your plugins configuration.");
-    }
-  const adapterInterface = adapter?.init(runtime);
-  return adapterInterface;
+    const adapterInterface = adapter?.init(runtime);
+    return adapterInterface;
 }
 
 async function startAgent(
@@ -828,16 +869,152 @@ const handlePostCharacterLoaded = async (character: Character): Promise<Characte
     return processedCharacter;
 }
 
+async function createAdminServer(directClient: DirectClient, charactersArg: string | undefined, adminPort: number) {
+    const http = await import('http');
+    const adminServer = http.createServer(async (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+
+        // Check if request is from localhost
+        const requestIP = req.socket.remoteAddress;
+        if (!requestIP || !['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(requestIP)) {
+            res.writeHead(403);
+            res.end(JSON.stringify({ success: false, message: 'Access denied. Only localhost requests are allowed.' }));
+            return;
+        }
+
+        if (req.method === 'POST') {
+            if (req.url === '/restart') {
+                await restartAllAgents(directClient, charactersArg);
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true, message: 'All agents restarted successfully' }));
+            } else if (req.url?.startsWith('/restart/')) {
+                const characterName = req.url.split('/')[2]?.toLowerCase();
+                if (characterName) {
+                    await restartSpecificCharacter(directClient, characterName, charactersArg);
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ success: true, message: `Character ${characterName} restarted successfully` }));
+                } else {
+                    res.writeHead(400);
+                    res.end(JSON.stringify({ success: false, message: 'Character name required' }));
+                }
+            } else if (req.url === '/add') {
+                let body = '';
+                req.on('data', chunk => {
+                    body += chunk.toString();
+                });
+                req.on('end', async () => {
+                    try {
+                        const { characterPath } = JSON.parse(body);
+                        if (!characterPath) {
+                            res.writeHead(400);
+                            res.end(JSON.stringify({ success: false, message: 'Character path is required' }));
+                            return;
+                        }
+                        await addNewCharacter(directClient, characterPath);
+                        res.writeHead(200);
+                        res.end(JSON.stringify({ success: true, message: 'Character added successfully' }));
+                    } catch (error) {
+                        res.writeHead(500);
+                        res.end(JSON.stringify({ success: false, message: error.message }));
+                    }
+                });
+            } else {
+                res.writeHead(404);
+                res.end(JSON.stringify({ success: false, message: 'Endpoint not found' }));
+            }
+        } else {
+            res.writeHead(405);
+            res.end(JSON.stringify({ success: false, message: 'Method not allowed' }));
+        }
+    });
+
+    // Start admin server
+    adminServer.listen(adminPort, () => {
+        elizaLogger.log(`Admin server listening on port ${adminPort}`);
+        elizaLogger.log(`Available endpoints:`);
+        elizaLogger.log(`  POST http://localhost:${adminPort}/restart - Restart all agents`);
+        elizaLogger.log(`  POST http://localhost:${adminPort}/restart/{characterName} - Restart specific character`);
+        elizaLogger.log(`  POST http://localhost:${adminPort}/add - Add new character (requires characterPath in body)`);
+    });
+
+    return adminServer;
+}
+
 const startAgents = async () => {
     const directClient = new DirectClient();
     let serverPort = Number.parseInt(settings.SERVER_PORT || "3000");
+    const adminPort = 8082; //TODO: move to .env
     const args = parseArguments();
     const charactersArg = args.characters || args.character;
     let characters = [defaultCharacter];
 
-    if ((charactersArg) || hasValidRemoteUrls()) {
-        characters = await loadCharacters(charactersArg);
-    }
+    characters = await loadCharactersFromServer();
+
+    /*try {
+        for (const character of characters) {
+            const processedCharacter = await handlePostCharacterLoaded(character);
+            await startAgent(processedCharacter, directClient);
+        }
+        // Add restart command handling to DirectClient's message system
+        const originalHandleMessage = directClient.handleMessage;
+        directClient.handleMessage = async (message) => {
+            if (message.content === '/restart') {
+                await restartAllAgents(directClient, charactersArg);
+                return { type: 'success', content: 'All agents restarted successfully' };
+            } else if (message.content.startsWith('/restart ')) {
+                const characterName = message.content.split(' ')[1].toLowerCase();
+                await restartSpecificCharacter(directClient, characterName, charactersArg);
+                return { type: 'success', content: `Character ${characterName} restarted successfully` };
+            }
+            // Call the original handler for all other messages
+            return originalHandleMessage.call(directClient, message);
+        };
+
+        // Create and start the admin server
+        await createAdminServer(directClient, charactersArg, adminPort);
+
+        // Listen for restart command from stdin
+        process.stdin.on('data', async (data) => {
+            const command = data.toString().trim();
+
+            if (command === 'restart') {
+                await restartAllAgents(directClient, charactersArg);
+            } else if (command.startsWith('restart ')) {
+                const characterName = command.split(' ')[1].toLowerCase();
+                await restartSpecificCharacter(directClient, characterName, charactersArg);
+            }
+        });
+
+        // Store the charactersArg for use in restarts
+        directClient.charactersArg = charactersArg;
+
+        // Find available port
+        while (!(await checkPortAvailable(serverPort))) {
+            elizaLogger.warn(`Port ${serverPort} is in use, trying ${serverPort + 1}`);
+            serverPort++;
+        }
+
+        // upload some agent functionality into directClient
+        directClient.startAgent = async (character) => {
+            // Handle plugins
+            character.plugins = await handlePluginImporting(character.plugins);
+            return startAgent(character, directClient);
+        };
+
+        directClient.start(serverPort);
+
+        if (serverPort !== parseInt(settings.SERVER_PORT || "3000")) {
+            elizaLogger.log(`Server started on alternate port ${serverPort}`);
+        }
+
+        elizaLogger.log("Run `pnpm start:client` to start the client and visit the outputted URL (http://localhost:5173) to chat with your agents.");
+        elizaLogger.log("Type 'restart' and press Enter to restart all agents.");
+    } catch (error) {
+        elizaLogger.error("Error starting agents:", error);
+    }*/
+
+   // Create and start the admin server
+   await createAdminServer(directClient, charactersArg, adminPort);
 
     try {
         for (const character of characters) {
@@ -888,6 +1065,103 @@ const startAgents = async () => {
         "Run `pnpm start:client` to start the client and visit the outputted URL (http://localhost:5173) to chat with your agents. When running multiple agents, use client with different port `SERVER_PORT=3001 pnpm start:client`"
     );
 };
+
+// Add these new functions above startAgents
+async function restartAllAgents(directClient: DirectClient, charactersArg: string | undefined) {
+    try {
+        elizaLogger.info('Restarting all agents...');
+
+        // Stop existing agents
+        for (const [id, agent] of Object.entries(directClient.agents)) {
+            elizaLogger.info(`Stopping agent: ${id}`);
+            if (typeof agent.stop === 'function') {
+                await agent.stop();
+            }
+        }
+
+        // Clear all agents
+        directClient.agents = {};
+
+        const characters = await loadCharactersFromServer();
+
+        // Reload and restart agents
+        for (const character of characters) {
+            const processedCharacter = await handlePostCharacterLoaded(character);
+            elizaLogger.info(`Restarting agent for character: ${character.name}`);
+            await startAgent(processedCharacter, directClient);
+        }
+        elizaLogger.info('All agents restarted successfully');
+    } catch (error) {
+        elizaLogger.error('Error during restart:', error);
+        elizaLogger.info('Attempting to continue with existing agents...');
+    }
+}
+
+async function restartSpecificCharacter(directClient: DirectClient, characterTokenId: string, charactersArg: string | undefined) {
+    let characterName = '';
+    try {
+        // input should be tokenId
+        // fetch character from server
+        const character = await loadCharacterFromServer(characterTokenId);
+
+        // Process the character with post processors
+        const processedCharacter = await handlePostCharacterLoaded(character);
+
+        characterName = character.name;
+
+        // Find and stop the existing agent
+        let foundAgent = false;
+        for (const [id, agent] of Object.entries(directClient.agents)) {
+            elizaLogger.info(`Checking agent: ${id}`);
+            if (id.toLowerCase().includes(characterName.toLowerCase())) {
+                elizaLogger.info(`Stopping agent: ${id}`);
+                if (typeof agent.stop === 'function') {
+                    await agent.stop();
+                }
+                delete directClient.agents[id];
+                foundAgent = true;
+                break;
+            }
+        }
+
+        if (!foundAgent) {
+            elizaLogger.warn(`No existing agent found for character: ${characterName}`);
+        }
+
+        // Start the new agent
+        elizaLogger.info(`Starting new agent for character: ${processedCharacter.name}`);
+        await startAgent(processedCharacter, directClient);
+        elizaLogger.info(`Character ${processedCharacter.name} restarted successfully`);
+    } catch (error) {
+        elizaLogger.error(`Error restarting character ${characterName}:`, error);
+        throw error; // Re-throw to be handled by caller
+    }
+}
+
+// Add this new function above startAgents
+async function addNewCharacter(directClient: DirectClient, characterPath: string) {
+    try {
+        elizaLogger.info(`Adding new character from: ${characterPath}`);
+
+        // Load the new character
+        const newCharacter = (await loadCharacters(characterPath))[0];
+        if (!newCharacter) {
+            elizaLogger.error(`Failed to load character from file: ${characterPath}`);
+            return;
+        }
+
+        // Process the character with post processors
+        const processedCharacter = await handlePostCharacterLoaded(newCharacter);
+
+        // Start the new agent
+        elizaLogger.info(`Starting new agent for character: ${processedCharacter.name}`);
+        await startAgent(processedCharacter, directClient);
+        elizaLogger.info(`Character ${processedCharacter.name} added successfully`);
+    } catch (error) {
+        elizaLogger.error(`Error adding character from ${characterPath}:`, error);
+        throw error;
+    }
+}
 
 startAgents().catch((error) => {
     elizaLogger.error("Unhandled error in startAgents:", error);
